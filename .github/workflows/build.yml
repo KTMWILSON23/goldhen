@@ -1,0 +1,85 @@
+name: Build PS4 ShellUI metadata collector
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "shellui/**"
+      - "payload/**"
+      - "tools/**"
+      - "Makefile"
+      - ".github/workflows/build.yml"
+  pull_request:
+    paths:
+      - "shellui/**"
+      - "payload/**"
+      - "tools/**"
+      - "Makefile"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    env:
+      OPENORBIS_RELEASE: v0.5.3
+      OPENORBIS_ARCHIVE: toolchain-llvm-18.2.zip
+      OPENORBIS_SHA256: 5006bb8629a40093b712fac971456fa4d5ad3fafaadb16d11c10b8a93b8b496f
+      GOLDHEN_SDK_COMMIT: bcea3c7ef01dac6d7f9f49ebf9e90fe66d86f5f7
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm make python3 unzip curl git
+
+      - name: Download OpenOrbis toolchain
+        run: |
+          curl -fLJO "https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/${OPENORBIS_RELEASE}/${OPENORBIS_ARCHIVE}"
+          echo "${OPENORBIS_SHA256}  ${OPENORBIS_ARCHIVE}" | sha256sum -c -
+          unzip "${OPENORBIS_ARCHIVE}"
+          tar -xzf toolchain-llvm-18.tar.gz
+          chmod +x OpenOrbis/PS4Toolchain/bin/linux/create-fself
+          echo "OO_PS4_TOOLCHAIN=${GITHUB_WORKSPACE}/OpenOrbis/PS4Toolchain" >> "${GITHUB_ENV}"
+
+      - name: Pin and build GoldHEN Plugins SDK
+        run: |
+          mkdir -p .deps
+          git clone https://github.com/GoldHEN/GoldHEN_Plugins_SDK.git .deps/GoldHEN_Plugins_SDK
+          git -C .deps/GoldHEN_Plugins_SDK checkout "${GOLDHEN_SDK_COMMIT}"
+          echo "GOLDHEN_SDK=${GITHUB_WORKSPACE}/.deps/GoldHEN_Plugins_SDK" >> "${GITHUB_ENV}"
+          make -C .deps/GoldHEN_Plugins_SDK
+
+      - name: Build ShellUI PRX
+        run: make shellui
+
+      - name: Embed exact PRX
+        run: make embed
+
+      - name: Build BinLoader payload
+        uses: Scene-Collective/ps4-payload-sdk@fd4f7299d1da5f5601c164a02b6d6d019ac8630a
+        with:
+          app_path: payload
+          build_command: make
+
+      - name: Verify embedded artifact
+        run: make verify
+
+      - name: Upload collector artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: xxfwilson23-shellui-metadata-collector-${{ github.run_id }}-${{ github.sha }}
+          path: |
+            shellui/bin/xxfwilson23_shellui_metadata_collector.prx
+            payload/shellui_metadata_loader.bin
+            payload/shellui_metadata_loader.map
+            build-manifest.json
+            artifact-sha256.txt
+            README.md
+            LICENSE
+            THIRD_PARTY_NOTICES.md

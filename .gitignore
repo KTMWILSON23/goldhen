@@ -1,0 +1,13 @@
+**/build/
+**/bin/
+**/__pycache__/
+.deps/
+payload/source/embedded_shellui_prx.c
+build-manifest.json
+artifact-sha256.txt
+*.bin
+*.map
+*.o
+*.elf
+*.oelf
+*.prx
