@@ -14,6 +14,7 @@
 #define GOLDHEN_SDK_CMD_VERSION 0
 #define GOLDHEN_SDK_CMD_PROCESS_PRX_LOAD 6
 #define SHELLUI_PRX_PATH "/data/xxfwilson23_rainbow_shellui.prx"
+#define PRX_LOAD_RESULT_SENTINEL ((uint64_t)-1)
 
 extern const unsigned char embedded_shellui_prx[];
 extern const size_t embedded_shellui_prx_len;
@@ -28,20 +29,28 @@ static int goldhen_command(uint64_t command, void *data) {
     return (int)syscall(500, command, data);
 }
 
-static int load_shellui_prx(const char *path) {
+static int load_shellui_prx(
+    const char *path,
+    int *command_result,
+    uint64_t *module_result
+) {
     struct proc_prx_load request;
     memset(&request, 0, sizeof(request));
     strncpy(request.process_name, "SceShellUI", sizeof(request.process_name) - 1);
     strncpy(request.prx_path, path, sizeof(request.prx_path) - 1);
+    request.result = PRX_LOAD_RESULT_SENTINEL;
 
-    int command_result = goldhen_command(
+    *command_result = goldhen_command(
         GOLDHEN_SDK_CMD_PROCESS_PRX_LOAD,
         &request
     );
-    if (command_result < 0) {
-        return command_result;
+    *module_result = request.result;
+    if (*command_result < 0 ||
+        request.result == PRX_LOAD_RESULT_SENTINEL ||
+        (int64_t)request.result < 0) {
+        return -1;
     }
-    return (int)request.result;
+    return 0;
 }
 
 static int write_all(int descriptor, const unsigned char *data, size_t length) {
@@ -62,10 +71,6 @@ int _main(struct thread *thread) {
     initLibc();
 
     int sdk_version = goldhen_command(GOLDHEN_SDK_CMD_VERSION, NULL);
-    if (sdk_version <= 0) {
-        printf_notification("XXFWilson23: GoldHEN SDK is unavailable");
-        return -1;
-    }
     if (!embedded_shellui_prx_len) {
         printf_notification("XXFWilson23: embedded ShellUI module is empty");
         return -2;
@@ -97,14 +102,22 @@ int _main(struct thread *thread) {
         return -4;
     }
 
-    result = load_shellui_prx(SHELLUI_PRX_PATH);
+    int load_command_result = 0;
+    uint64_t load_module_result = PRX_LOAD_RESULT_SENTINEL;
+    result = load_shellui_prx(
+        SHELLUI_PRX_PATH,
+        &load_command_result,
+        &load_module_result
+    );
     if (result < 0) {
         unlink(SHELLUI_PRX_PATH);
         printf_notification(
-            "XXFWilson23: ShellUI module load failed (%d)",
-            result
+            "XXFWilson23: PRX load failed sdk=%d cmd=%d res=0x%llx",
+            sdk_version,
+            load_command_result,
+            (unsigned long long)load_module_result
         );
-        return result;
+        return -5;
     }
 
 #if XXF_RAINBOW_COLLECTOR
