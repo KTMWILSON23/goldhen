@@ -81,7 +81,7 @@ int _main(struct thread *thread) {
     int descriptor = open(
         SHELLUI_PRX_PATH,
         O_WRONLY | O_CREAT | O_TRUNC,
-        0644
+        0777
     );
     if (descriptor < 0) {
         printf_notification("XXFWilson23: temporary module write failed");
@@ -93,13 +93,16 @@ int _main(struct thread *thread) {
         embedded_shellui_prx,
         embedded_shellui_prx_len
     );
+    if (result == 0 && fchmod(descriptor, 0777) < 0) {
+        result = -1;
+    }
     int close_result = close(descriptor);
     if (result == 0 && close_result < 0) {
         result = -1;
     }
     if (result != 0) {
         unlink(SHELLUI_PRX_PATH);
-        printf_notification("XXFWilson23: incomplete ShellUI module write");
+        printf_notification("XXFWilson23: module write or permission setup failed");
         return -4;
     }
 

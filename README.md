@@ -15,8 +15,9 @@ The build has two parts:
 2. `payload/shellui_metadata_loader.bin` embeds that PRX, writes it to
    `/user/data/xxfwilson23_shellui_metadata_collector.prx`, and asks GoldHEN
    SDK syscall 500 to load it into `SceShellUI`. `/user/data` is shared across
-   the BinLoader and `SceShellUI` process sandboxes. The loader removes that
-   file only if writing or loading fails.
+   the BinLoader and `SceShellUI` process sandboxes. Before loading, the file is
+   set to mode `0777`, matching GoldHEN's own plugin-loader requirement. The
+   loader removes that file only if writing, permission setup, or loading fails.
 3. The PRX writes bounded evidence to
    `/data/xxfwilson23-rainbow/pui-metadata-1402.txt`, including a completion
    status and SHA-256 digest.
