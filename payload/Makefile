@@ -10,16 +10,12 @@ ODIR := build
 SDIR := source
 IDIRS := -I$(LIBPS4)/include
 LDIRS := -L$(LIBPS4)
-TARGET := shellui_metadata_loader.bin
-MAPFILE := shellui_metadata_loader.map
-RAINBOW_METADATA_READY ?= 0
-RAINBOW_COLLECTOR ?= 1
+TARGET := rainbow_loader.bin
+MAPFILE := rainbow_loader.map
 
 CFLAGS := $(IDIRS) -Os -std=c11 -fno-builtin -nostartfiles -nostdlib \
 	-Wall -Wextra -Werror -masm=intel -march=btver2 -mtune=btver2 \
-	-m64 -mabi=sysv -mcmodel=small -fpie -ffunction-sections -fdata-sections \
-	-DXXF_RAINBOW_METADATA_READY=$(RAINBOW_METADATA_READY) \
-	-DXXF_RAINBOW_COLLECTOR=$(RAINBOW_COLLECTOR)
+	-m64 -mabi=sysv -mcmodel=small -fpie -ffunction-sections -fdata-sections
 LFLAGS := $(LDIRS) -Xlinker -T $(LIBPS4)/linker.x \
 	-Xlinker -Map=$(MAPFILE) -Wl,--build-id=none -Wl,--gc-sections \
 	-Wl,-z,noexecstack

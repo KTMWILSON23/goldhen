@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Embed one audited ShellUI PRX in the BinLoader payload source."""
+"""Embed the audited rainbow ShellUI PRX in the BinLoader payload source."""
 
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ def main() -> int:
     args.output.write_text(source, encoding="ascii", newline="\n")
 
     record = {
-        "component": "xxfwilson23_shellui_metadata_collector.prx",
+        "component": args.input.name,
         "sha256": digest,
         "size": len(data),
     }

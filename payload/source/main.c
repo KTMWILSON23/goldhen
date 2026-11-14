@@ -1,5 +1,5 @@
 /*
- * XXFWilson23 one-shot BinLoader payload.
+ * XXFWilson23 one-shot rainbow ShellUI BinLoader payload.
  *
  * The generated embedded_shellui_prx.c is produced from the PRX built in the
  * same workflow. The payload writes it to /user/data, which is shared across
@@ -14,7 +14,7 @@
 
 #define GOLDHEN_SDK_CMD_VERSION 0
 #define GOLDHEN_SDK_CMD_PROCESS_PRX_LOAD 6
-#define SHELLUI_PRX_PATH "/user/data/xxfwilson23_shellui_metadata_collector.prx"
+#define SHELLUI_PRX_PATH "/user/data/xxfwilson23_rainbow_shellui.prx"
 #define PRX_LOAD_RESULT_SENTINEL ((uint64_t)-1)
 
 extern const unsigned char embedded_shellui_prx[];
@@ -124,12 +124,6 @@ int _main(struct thread *thread) {
         return -5;
     }
 
-#if XXF_RAINBOW_COLLECTOR
-    printf_notification("XXFWilson23: ShellUI metadata collector loaded");
-#elif XXF_RAINBOW_METADATA_READY
-    printf_notification("XXFWilson23: rainbow ShellUI text enabled");
-#else
-    printf_notification("XXFWilson23: module loaded; metadata gate is pending");
-#endif
+    printf_notification("XXFWilson23: rainbow ShellUI module loaded");
     return 0;
 }

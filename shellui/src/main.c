@@ -1,10 +1,10 @@
 /*
- * XXFWilson23 volatile ShellUI rainbow module.
+ * XXFWilson23 standalone ShellUI rainbow text module for PS4 14.02.
  *
- * This file deliberately contains no unverified 14.02 tree traversal or
- * prologue detour. It attaches to the existing Mono runtime, proves the PUI
- * members needed by the final effect, and stops at a compile-time validation
- * gate until the live metadata capture supplies the exact root/child path.
+ * The only native detour is the live-metadata-proven UI2.Label.OnPrepareRender
+ * method.  A trampoline is installed only when every copied instruction is
+ * position independent. Relative control flow and RIP-relative operands fail
+ * closed instead of being copied unsafely.
  */
 
 #include <stdbool.h>
@@ -13,6 +13,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 typedef struct MonoDomain MonoDomain;
 typedef struct MonoAssembly MonoAssembly;
@@ -46,250 +47,112 @@ typedef struct MonoMethodPInvoke MonoMethodPInvoke;
 typedef struct MonoMethodInflated MonoMethodInflated;
 typedef struct MonoGenericInst MonoGenericInst;
 typedef struct MonoGenericContext MonoGenericContext;
-typedef struct MonoTableInfo MonoTableInfo;
 
 #include <orbis/libmonovm.h>
 #include <orbis/libkernel.h>
+#include "HDE64.h"
 
-#ifndef XXF_RAINBOW_COLLECTOR
-#define XXF_RAINBOW_COLLECTOR 1
-#endif
+#define RAINBOW_DIR "/user/data/xxfwilson23-rainbow"
+#define RAINBOW_LOG RAINBOW_DIR "/rainbow-1402.log"
+#define RAINBOW_INTERVAL_US 50000ULL
+#define RAINBOW_HUE_STEPS 1536ULL
+#define RAINBOW_HUE_ADVANCE 8ULL
+#define RAINBOW_PALETTE_SIZE \
+    (RAINBOW_HUE_STEPS / RAINBOW_HUE_ADVANCE)
+#define RAINBOW_SEEN_CAPACITY 2048U
+#define REL_JUMP_SIZE 5U
+#define ABS_JUMP_SIZE 14U
+#define MAX_PROLOGUE_SIZE 32U
+#define MONO_TYPE_VOID 0x01
+#define MONO_TYPE_U1 0x05
+#define MONO_TYPE_VALUETYPE 0x11
+#define MONO_METHOD_ATTR_STATIC 0x0010U
 
-#define EVIDENCE_DIR "/user/data/xxfwilson23-rainbow"
-#define LOG_PATH EVIDENCE_DIR "/pui-metadata-1402.txt"
-#define EVIDENCE_MAX_BYTES (512U * 1024U)
-#define MONO_TABLE_TYPEDEF 0x02
-#define MONO_TOKEN_TYPE_DEF 0x02000000U
-#define MAX_RELEVANT_CLASSES 512U
-#define MAX_PROPERTIES_PER_CLASS 96U
-#define MAX_METHODS_PER_CLASS 192U
-#define RAINBOW_PENDING_METADATA (-1402)
-
-/* libmonosgen exports these metadata APIs, but the OpenOrbis header only
- * declares the smaller embedding subset. Keep their standard Mono ABI here. */
-extern const MonoTableInfo *mono_image_get_table_info(MonoImage *image, int table_id);
-extern int mono_table_info_get_rows(const MonoTableInfo *table);
-extern MonoClass *mono_class_get(MonoImage *image, uint32_t token);
-extern const char *mono_class_get_name(MonoClass *klass);
-extern const char *mono_class_get_namespace(MonoClass *klass);
-extern MonoClass *mono_class_get_parent(MonoClass *klass);
-extern MonoProperty *mono_class_get_properties(MonoClass *klass, void **iter);
-extern const char *mono_property_get_name(MonoProperty *property);
+/* These are exported by libmonosgen but omitted/incorrectly typed in the
+ * OpenOrbis v0.5.3 header. */
+extern MonoClass *xxf_mono_object_get_class(MonoObject *object)
+    __asm__("mono_object_get_class");
 extern MonoMethodSignature *mono_method_signature(MonoMethod *method);
 extern uint32_t mono_signature_get_param_count(MonoMethodSignature *signature);
-
-/*
- * Managed PUI value type ABI: the UIColor argument is passed by address to a
- * Mono AOT thunk. A by-value native struct would use the wrong registers and
- * can crash ShellUI.
- */
-typedef struct RainbowUIColor {
-    float r;
-    float g;
-    float b;
-    float a;
-} RainbowUIColor;
-
-typedef void (*PuiTextColorAotFn)(
-    void *label_instance,
-    const RainbowUIColor *color
+extern MonoType *mono_signature_get_params(
+    MonoMethodSignature *signature,
+    void **iterator
 );
+extern MonoType *mono_signature_get_return_type(
+    MonoMethodSignature *signature
+);
+extern int xxf_mono_type_get_type(MonoType *type)
+    __asm__("mono_type_get_type");
+extern uint32_t mono_method_get_flags(
+    MonoMethod *method,
+    uint32_t *implementation_flags
+);
+extern MonoClass *mono_method_get_class(MonoMethod *method);
 
-typedef struct RainbowRuntimeEvidence {
+typedef void (*OnPrepareRenderFn)(void *instance);
+
+typedef struct SafeHook {
+    uintptr_t target;
+    uint8_t original[MAX_PROLOGUE_SIZE];
+    uint8_t patch[REL_JUMP_SIZE];
+    size_t stolen_length;
+    void *trampoline;
+    size_t trampoline_size;
+    bool installed;
+} SafeHook;
+
+typedef struct RainbowRuntime {
     MonoDomain *domain;
-    MonoThread *attached_thread;
-    MonoImage *pui_image;
-    MonoClass *label_class;
-    MonoMethod *text_color_setter;
-    MonoMethod *application_update;
-    PuiTextColorAotFn text_color_aot;
-    void *application_update_aot;
-} RainbowRuntimeEvidence;
+    MonoThread *thread;
+    MonoImage *pui;
+    MonoClass *label;
+    MonoClass *color;
+    MonoMethod *set_text_color;
+    MonoMethod *from_byte;
+    MonoMethod *on_prepare_render;
+} RainbowRuntime;
 
 static int g_log_fd = -1;
-static size_t g_evidence_bytes = 0;
-static bool g_evidence_truncated = false;
-static bool g_evidence_write_failed = false;
-
-typedef struct Sha256Context {
-    uint32_t state[8];
-    uint64_t bit_count;
-    uint8_t block[64];
-    size_t block_size;
-} Sha256Context;
-
-static Sha256Context g_evidence_hash;
-static bool g_hash_evidence = false;
-
-static uint32_t rotr32(uint32_t value, uint32_t shift) {
-    return (value >> shift) | (value << (32U - shift));
-}
-
-static void sha256_transform(Sha256Context *ctx, const uint8_t block[64]) {
-    static const uint32_t k[64] = {
-        0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U,
-        0x3956c25bU, 0x59f111f1U, 0x923f82a4U, 0xab1c5ed5U,
-        0xd807aa98U, 0x12835b01U, 0x243185beU, 0x550c7dc3U,
-        0x72be5d74U, 0x80deb1feU, 0x9bdc06a7U, 0xc19bf174U,
-        0xe49b69c1U, 0xefbe4786U, 0x0fc19dc6U, 0x240ca1ccU,
-        0x2de92c6fU, 0x4a7484aaU, 0x5cb0a9dcU, 0x76f988daU,
-        0x983e5152U, 0xa831c66dU, 0xb00327c8U, 0xbf597fc7U,
-        0xc6e00bf3U, 0xd5a79147U, 0x06ca6351U, 0x14292967U,
-        0x27b70a85U, 0x2e1b2138U, 0x4d2c6dfcU, 0x53380d13U,
-        0x650a7354U, 0x766a0abbU, 0x81c2c92eU, 0x92722c85U,
-        0xa2bfe8a1U, 0xa81a664bU, 0xc24b8b70U, 0xc76c51a3U,
-        0xd192e819U, 0xd6990624U, 0xf40e3585U, 0x106aa070U,
-        0x19a4c116U, 0x1e376c08U, 0x2748774cU, 0x34b0bcb5U,
-        0x391c0cb3U, 0x4ed8aa4aU, 0x5b9cca4fU, 0x682e6ff3U,
-        0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U,
-        0x90befffaU, 0xa4506cebU, 0xbef9a3f7U, 0xc67178f2U,
-    };
-    uint32_t w[64];
-    for (size_t i = 0; i < 16; ++i) {
-        size_t at = i * 4;
-        w[i] = ((uint32_t)block[at] << 24) |
-               ((uint32_t)block[at + 1] << 16) |
-               ((uint32_t)block[at + 2] << 8) |
-               (uint32_t)block[at + 3];
-    }
-    for (size_t i = 16; i < 64; ++i) {
-        uint32_t s0 = rotr32(w[i - 15], 7) ^ rotr32(w[i - 15], 18) ^
-                      (w[i - 15] >> 3);
-        uint32_t s1 = rotr32(w[i - 2], 17) ^ rotr32(w[i - 2], 19) ^
-                      (w[i - 2] >> 10);
-        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
-    }
-
-    uint32_t a = ctx->state[0];
-    uint32_t b = ctx->state[1];
-    uint32_t c = ctx->state[2];
-    uint32_t d = ctx->state[3];
-    uint32_t e = ctx->state[4];
-    uint32_t f = ctx->state[5];
-    uint32_t g = ctx->state[6];
-    uint32_t h = ctx->state[7];
-    for (size_t i = 0; i < 64; ++i) {
-        uint32_t s1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25);
-        uint32_t choose = (e & f) ^ ((~e) & g);
-        uint32_t temp1 = h + s1 + choose + k[i] + w[i];
-        uint32_t s0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22);
-        uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
-        uint32_t temp2 = s0 + majority;
-        h = g;
-        g = f;
-        f = e;
-        e = d + temp1;
-        d = c;
-        c = b;
-        b = a;
-        a = temp1 + temp2;
-    }
-    ctx->state[0] += a;
-    ctx->state[1] += b;
-    ctx->state[2] += c;
-    ctx->state[3] += d;
-    ctx->state[4] += e;
-    ctx->state[5] += f;
-    ctx->state[6] += g;
-    ctx->state[7] += h;
-}
-
-static void sha256_init(Sha256Context *ctx) {
-    memset(ctx, 0, sizeof(*ctx));
-    ctx->state[0] = 0x6a09e667U;
-    ctx->state[1] = 0xbb67ae85U;
-    ctx->state[2] = 0x3c6ef372U;
-    ctx->state[3] = 0xa54ff53aU;
-    ctx->state[4] = 0x510e527fU;
-    ctx->state[5] = 0x9b05688cU;
-    ctx->state[6] = 0x1f83d9abU;
-    ctx->state[7] = 0x5be0cd19U;
-}
-
-static void sha256_update(Sha256Context *ctx, const void *data_ptr, size_t length) {
-    const uint8_t *data = (const uint8_t *)data_ptr;
-    for (size_t i = 0; i < length; ++i) {
-        ctx->block[ctx->block_size++] = data[i];
-        if (ctx->block_size == sizeof(ctx->block)) {
-            sha256_transform(ctx, ctx->block);
-            ctx->bit_count += 512U;
-            ctx->block_size = 0;
-        }
-    }
-}
-
-static void sha256_final(Sha256Context *ctx, uint8_t digest[32]) {
-    ctx->bit_count += (uint64_t)ctx->block_size * 8U;
-    ctx->block[ctx->block_size++] = 0x80U;
-    if (ctx->block_size > 56U) {
-        while (ctx->block_size < 64U) {
-            ctx->block[ctx->block_size++] = 0;
-        }
-        sha256_transform(ctx, ctx->block);
-        ctx->block_size = 0;
-    }
-    while (ctx->block_size < 56U) {
-        ctx->block[ctx->block_size++] = 0;
-    }
-    for (size_t i = 0; i < 8; ++i) {
-        ctx->block[63U - i] = (uint8_t)(ctx->bit_count >> (i * 8U));
-    }
-    sha256_transform(ctx, ctx->block);
-    for (size_t i = 0; i < 8; ++i) {
-        digest[i * 4] = (uint8_t)(ctx->state[i] >> 24);
-        digest[i * 4 + 1] = (uint8_t)(ctx->state[i] >> 16);
-        digest[i * 4 + 2] = (uint8_t)(ctx->state[i] >> 8);
-        digest[i * 4 + 3] = (uint8_t)ctx->state[i];
-    }
-}
-
-static bool write_bytes(const void *data, size_t length, bool enforce_limit) {
-    if (g_log_fd < 0 || g_evidence_write_failed) {
-        return false;
-    }
-    if (enforce_limit && g_evidence_bytes + length > EVIDENCE_MAX_BYTES) {
-        g_evidence_truncated = true;
-        return false;
-    }
-    size_t offset = 0;
-    while (offset < length) {
-        size_t written = sceKernelWrite(
-            g_log_fd,
-            (const uint8_t *)data + offset,
-            length - offset
-        );
-        if (written == 0 || written == (size_t)-1) {
-            g_evidence_write_failed = true;
-            return false;
-        }
-        offset += written;
-    }
-    if (g_hash_evidence) {
-        sha256_update(&g_evidence_hash, data, length);
-    }
-    g_evidence_bytes += length;
-    return true;
-}
+static SafeHook g_hook;
+static OnPrepareRenderFn g_original = NULL;
+static uint32_t g_palette[RAINBOW_PALETTE_SIZE];
+static uintptr_t g_seen_labels[RAINBOW_SEEN_CAPACITY];
+static uint64_t g_seen_bucket = UINT64_MAX;
+static MonoClass *g_color_class = NULL;
+static MonoMethod *g_set_text_color = NULL;
+static MonoMethod *g_from_byte = NULL;
+static bool g_effect_enabled = false;
+static bool g_effect_failed = false;
+static bool g_hook_active = false;
 
 static void log_line(const char *format, ...) {
     if (g_log_fd < 0) {
         return;
     }
-
-    char line[512];
+    char line[384];
     va_list args;
     va_start(args, format);
-    int length = vsnprintf(line, sizeof(line), format, args);
+    int length = vsnprintf(line, sizeof(line) - 1U, format, args);
     va_end(args);
-
     if (length <= 0) {
         return;
     }
-    if ((size_t)length >= sizeof(line) - 1) {
+    if ((size_t)length >= sizeof(line) - 1U) {
         length = (int)sizeof(line) - 2;
     }
     line[length++] = '\n';
-    write_bytes(line, (size_t)length, true);
+    size_t offset = 0;
+    while (offset < (size_t)length) {
+        size_t written = sceKernelWrite(
+            g_log_fd,
+            line + offset,
+            (size_t)length - offset
+        );
+        if (written == 0 || written == (size_t)-1) {
+            break;
+        }
+        offset += written;
+    }
 }
 
 static void notify_user(const char *format, ...) {
@@ -298,7 +161,6 @@ static void notify_user(const char *format, ...) {
     request.type = NotificationRequest;
     request.targetId = -1;
     request.userId = -1;
-
     va_list args;
     va_start(args, format);
     vsnprintf(request.message, sizeof(request.message), format, args);
@@ -306,447 +168,609 @@ static void notify_user(const char *format, ...) {
     sceKernelSendNotificationRequest(0, &request, sizeof(request), 0);
 }
 
-static int ascii_lower(int value) {
-    return (value >= 'A' && value <= 'Z') ? value + ('a' - 'A') : value;
-}
-
-static bool contains_case_insensitive(const char *text, const char *needle) {
-    if (!text || !needle || !needle[0]) {
-        return false;
-    }
-    for (const char *start = text; *start; ++start) {
-        const char *left = start;
-        const char *right = needle;
-        while (*left && *right && ascii_lower((unsigned char)*left) ==
-               ascii_lower((unsigned char)*right)) {
-            ++left;
-            ++right;
-        }
-        if (!*right) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool class_is_relevant(const char *name_space, const char *name) {
-    static const char *terms[] = {
-        "Application", "Label", "Widget", "Scene", "Layer", "Area",
-        "Root", "Theme", "Node", "Container", "View", "Element",
-        "Frame", "Panel", "Color", "Text", "Focus", "Page", "Menu",
-    };
-    for (size_t i = 0; i < sizeof(terms) / sizeof(terms[0]); ++i) {
-        if (contains_case_insensitive(name, terms[i]) ||
-            contains_case_insensitive(name_space, terms[i])) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static void dump_class_metadata(const char *image_label, MonoClass *klass) {
-    const char *name = mono_class_get_name(klass);
-    const char *name_space = mono_class_get_namespace(klass);
-    MonoClass *parent = mono_class_get_parent(klass);
-    const char *parent_name = parent ? mono_class_get_name(parent) : "";
-    const char *parent_namespace = parent ? mono_class_get_namespace(parent) : "";
-    log_line(
-        "CLASS image=%s namespace=%s name=%s parent=%s.%s",
-        image_label,
-        name_space ? name_space : "",
-        name ? name : "",
-        parent_namespace ? parent_namespace : "",
-        parent_name ? parent_name : ""
+static long syscall_108(
+    long pid,
+    uintptr_t address,
+    void *buffer,
+    size_t length,
+    long write
+) {
+    unsigned long result;
+    unsigned char is_error;
+    register long argument4 __asm__("r10") = (long)length;
+    register long argument5 __asm__("r8") = write;
+    __asm__ __volatile__(
+        "syscall"
+        : "=a"(result), "=@ccc"(is_error), "+r"(argument4),
+          "+r"(argument5)
+        : "a"(108L), "D"(pid), "S"((long)address), "d"(buffer)
+        : "rcx", "r11", "memory"
     );
-
-    void *property_iter = NULL;
-    MonoProperty *property = NULL;
-    uint32_t property_count = 0;
-    while (!g_evidence_truncated && property_count < MAX_PROPERTIES_PER_CLASS &&
-           (property = mono_class_get_properties(klass, &property_iter)) != NULL) {
-        const char *property_name = mono_property_get_name(property);
-        MonoMethod *getter = mono_property_get_get_method(property);
-        MonoMethod *setter = mono_property_get_set_method(property);
-        log_line(
-            " PROPERTY name=%s getter=%u setter=%u",
-            property_name ? property_name : "",
-            getter ? 1U : 0U,
-            setter ? 1U : 0U
-        );
-        ++property_count;
-    }
-    if (property != NULL) {
-        log_line(" PROPERTY_LIMIT count=%u", property_count);
-    }
-
-    void *method_iter = NULL;
-    MonoMethod *method = NULL;
-    uint32_t method_count = 0;
-    while (!g_evidence_truncated && method_count < MAX_METHODS_PER_CLASS &&
-           (method = mono_class_get_methods(klass, &method_iter)) != NULL) {
-        const char *method_name = mono_method_get_name(method);
-        MonoMethodSignature *signature = mono_method_signature(method);
-        uint32_t parameter_count = signature
-            ? mono_signature_get_param_count(signature)
-            : UINT32_MAX;
-        log_line(
-            " METHOD name=%s params=%u",
-            method_name ? method_name : "",
-            parameter_count
-        );
-        ++method_count;
-    }
-    if (method != NULL) {
-        log_line(" METHOD_LIMIT count=%u", method_count);
-    }
-    log_line("END_CLASS properties=%u methods=%u", property_count, method_count);
+    return is_error ? -(long)result : (long)result;
 }
 
-static int dump_image_metadata(const char *label, MonoImage *image) {
-    if (!image) {
-        log_line("IMAGE label=%s status=missing", label);
+static int process_rw(
+    uintptr_t address,
+    void *buffer,
+    size_t length,
+    bool write
+) {
+    if (!address || !buffer || !length) {
         return -1;
     }
-    const MonoTableInfo *type_table = mono_image_get_table_info(
-        image,
-        MONO_TABLE_TYPEDEF
+    return (int)syscall_108(
+        getpid(),
+        address,
+        buffer,
+        length,
+        write ? 1 : 0
     );
-    if (!type_table) {
-        log_line("IMAGE label=%s status=no-typedef-table", label);
+}
+
+static void make_absolute_jump(
+    uint8_t output[ABS_JUMP_SIZE],
+    uintptr_t destination
+) {
+    static const uint8_t prefix[6] = {0xff, 0x25, 0, 0, 0, 0};
+    memcpy(output, prefix, sizeof(prefix));
+    memcpy(output + sizeof(prefix), &destination, sizeof(destination));
+}
+
+static bool is_return(const hde64s *decoded) {
+    return decoded->opcode == 0xc2 || decoded->opcode == 0xc3 ||
+           decoded->opcode == 0xca || decoded->opcode == 0xcb ||
+           decoded->opcode == 0xcf;
+}
+
+static bool is_unsupported_control_flow(const hde64s *decoded) {
+    if (is_return(decoded) || decoded->opcode == 0x9a ||
+        decoded->opcode == 0xea || decoded->opcode == 0xcc ||
+        decoded->opcode == 0xcd || decoded->opcode == 0xce ||
+        decoded->opcode == 0xf4) {
+        return true;
+    }
+    if (decoded->opcode == 0xff && (decoded->flags & F_MODRM) &&
+        decoded->modrm_reg >= 2 && decoded->modrm_reg <= 5) {
+        return true;
+    }
+    return decoded->opcode == 0x0f && decoded->opcode2 == 0x0b;
+}
+
+static int safe_prologue_size(const uint8_t *bytes, size_t available) {
+    size_t offset = 0;
+    while (offset < REL_JUMP_SIZE) {
+        hde64s decoded;
+        memset(&decoded, 0, sizeof(decoded));
+        unsigned int length = hde64_disasm(bytes + offset, &decoded);
+        if (!length || length != decoded.len || decoded.flags & F_ERROR) {
+            return -1;
+        }
+        if (offset + length > available || decoded.flags & F_RELATIVE) {
+            return -2;
+        }
+        if (is_unsupported_control_flow(&decoded)) {
+            return -3;
+        }
+        if ((decoded.flags & F_MODRM) && decoded.modrm_mod == 0 &&
+            decoded.modrm_rm == 5 && decoded.p_67 == 0) {
+            return -4;
+        }
+        offset += length;
+    }
+    return offset <= MAX_PROLOGUE_SIZE ? (int)offset : -5;
+}
+
+static bool restore_hook_prefix(SafeHook *hook) {
+    uint8_t verify[REL_JUMP_SIZE];
+    bool restored = process_rw(
+        hook->target,
+        hook->original,
+        REL_JUMP_SIZE,
+        true
+    ) == 0 && process_rw(
+        hook->target,
+        verify,
+        sizeof(verify),
+        false
+    ) == 0 && memcmp(
+        verify,
+        hook->original,
+        sizeof(verify)
+    ) == 0;
+    __builtin___clear_cache(
+        (char *)hook->target,
+        (char *)(hook->target + REL_JUMP_SIZE)
+    );
+    return restored;
+}
+
+static int install_hook(
+    SafeHook *hook,
+    uintptr_t target,
+    uintptr_t replacement,
+    OnPrepareRenderFn *original_out
+) {
+    if (!hook || !target || !replacement || !original_out) {
+        return -1;
+    }
+    memset(hook, 0, sizeof(*hook));
+    uint8_t snapshot[MAX_PROLOGUE_SIZE];
+    if (process_rw(target, snapshot, sizeof(snapshot), false) != 0) {
         return -2;
     }
-    int rows = mono_table_info_get_rows(type_table);
-    if (rows <= 0) {
-        log_line("IMAGE label=%s status=empty rows=%d", label, rows);
+    /* Refuse to stack on any existing jump/detour. */
+    if ((snapshot[0] == 0xff && snapshot[1] == 0x25) ||
+        snapshot[0] == 0xe9 || snapshot[0] == 0xeb) {
         return -3;
     }
-
-    uint32_t relevant = 0;
-    log_line("IMAGE label=%s status=scanning typedef_rows=%d", label, rows);
-    for (int row = 1; row <= rows && !g_evidence_truncated; ++row) {
-        MonoClass *klass = mono_class_get(
-            image,
-            MONO_TOKEN_TYPE_DEF | (uint32_t)row
-        );
-        if (!klass) {
-            continue;
-        }
-        const char *name = mono_class_get_name(klass);
-        const char *name_space = mono_class_get_namespace(klass);
-        if (!class_is_relevant(name_space, name)) {
-            continue;
-        }
-        dump_class_metadata(label, klass);
-        ++relevant;
-        if (relevant >= MAX_RELEVANT_CLASSES) {
-            log_line("CLASS_LIMIT image=%s count=%u", label, relevant);
-            break;
-        }
+    intptr_t displacement = (intptr_t)replacement -
+        (intptr_t)(target + REL_JUMP_SIZE);
+    if (displacement < INT32_MIN || displacement > INT32_MAX) {
+        return -4;
     }
-    log_line(
-        "END_IMAGE label=%s relevant_classes=%u truncated=%u",
-        label,
-        relevant,
-        g_evidence_truncated ? 1U : 0U
+    int decoded = safe_prologue_size(snapshot, sizeof(snapshot));
+    if (decoded < (int)REL_JUMP_SIZE) {
+        return -10 + decoded;
+    }
+
+    hook->target = target;
+    hook->stolen_length = (size_t)decoded;
+    memcpy(hook->original, snapshot, hook->stolen_length);
+    hook->patch[0] = 0xe9;
+    int32_t relative = (int32_t)displacement;
+    memcpy(hook->patch + 1, &relative, sizeof(relative));
+    hook->trampoline_size = hook->stolen_length + ABS_JUMP_SIZE;
+    int result = sceKernelMmap(
+        NULL,
+        hook->trampoline_size,
+        VM_PROT_ALL,
+        0x1000 | 0x2,
+        -1,
+        0,
+        &hook->trampoline
     );
+    if (result < 0 || !hook->trampoline) {
+        return -20;
+    }
+    memcpy(hook->trampoline, hook->original, hook->stolen_length);
+    make_absolute_jump(
+        (uint8_t *)hook->trampoline + hook->stolen_length,
+        hook->target + hook->stolen_length
+    );
+    __builtin___clear_cache(
+        (char *)hook->trampoline,
+        (char *)hook->trampoline + hook->trampoline_size
+    );
+
+    __atomic_store_n(
+        original_out,
+        (OnPrepareRenderFn)hook->trampoline,
+        __ATOMIC_RELEASE
+    );
+    if (process_rw(hook->target, hook->patch, REL_JUMP_SIZE, true) != 0) {
+        uint8_t current[REL_JUMP_SIZE];
+        bool unchanged = process_rw(
+            hook->target,
+            current,
+            sizeof(current),
+            false
+        ) == 0 && memcmp(
+            current,
+            hook->original,
+            sizeof(current)
+        ) == 0;
+        if (!unchanged && !restore_hook_prefix(hook)) {
+            hook->installed = true;
+            return -24;
+        }
+        __atomic_store_n(original_out, NULL, __ATOMIC_RELEASE);
+        sceKernelMunmap(hook->trampoline, hook->trampoline_size);
+        memset(hook, 0, sizeof(*hook));
+        return -21;
+    }
+    uint8_t verify[REL_JUMP_SIZE];
+    memset(verify, 0, sizeof(verify));
+    if (process_rw(hook->target, verify, sizeof(verify), false) != 0 ||
+        memcmp(verify, hook->patch, sizeof(verify)) != 0) {
+        if (!restore_hook_prefix(hook)) {
+            /* Keep the trampoline and original pointer resident in case the
+             * target contains a complete jump despite the failed readback. */
+            hook->installed = true;
+            return -23;
+        }
+        __atomic_store_n(original_out, NULL, __ATOMIC_RELEASE);
+        sceKernelMunmap(hook->trampoline, hook->trampoline_size);
+        memset(hook, 0, sizeof(*hook));
+        return -22;
+    }
+    __builtin___clear_cache(
+        (char *)hook->target,
+        (char *)(hook->target + REL_JUMP_SIZE)
+    );
+    hook->installed = true;
     return 0;
 }
 
-static MonoImage *open_image_candidates(
-    MonoDomain *domain,
-    const char *label,
-    const char *const *paths,
-    size_t path_count
-) {
-    for (size_t i = 0; i < path_count; ++i) {
-        MonoAssembly *assembly = mono_domain_assembly_open(domain, paths[i]);
-        if (!assembly) {
-            continue;
-        }
-        MonoImage *image = mono_assembly_get_image(assembly);
-        if (image) {
-            log_line("ASSEMBLY label=%s path=%s status=opened", label, paths[i]);
-            return image;
-        }
-    }
-    log_line("ASSEMBLY label=%s status=not-found", label);
-    return NULL;
-}
-
-static MonoImage *open_pui_image(MonoDomain *domain) {
+static MonoImage *open_pui(MonoDomain *domain) {
     const char *sandbox = sceKernelGetFsSandboxRandomWord();
     if (!sandbox) {
         return NULL;
     }
-
     static const char *suffixes[] = {
         "/common/lib/Sce.PlayStation.PUI.dll",
         "/common/lib/Sce.PlayStation.PUI.dll.sprx",
     };
-
     char path[260];
     for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); ++i) {
         snprintf(path, sizeof(path), "/%s%s", sandbox, suffixes[i]);
         MonoAssembly *assembly = mono_domain_assembly_open(domain, path);
-        if (!assembly) {
-            continue;
-        }
-        MonoImage *image = mono_assembly_get_image(assembly);
-        if (image) {
-            log_line("PUI image opened: %s", path);
-            return image;
+        if (assembly) {
+            MonoImage *image = mono_assembly_get_image(assembly);
+            if (image) {
+                log_line("PUI image opened: %s", path);
+                return image;
+            }
         }
     }
     return NULL;
 }
 
-static MonoImage *open_shellui_app_image(MonoDomain *domain) {
-    static const char *paths[] = {
-        "/app0/psm/Application/app.exe",
-        "/app0/psm/Application/app.exe.sprx",
-    };
-    return open_image_candidates(
-        domain,
-        "SceShellUI-app",
-        paths,
-        sizeof(paths) / sizeof(paths[0])
+static MonoObject *create_color(
+    uint8_t red,
+    uint8_t green,
+    uint8_t blue,
+    uint8_t alpha,
+    MonoObject **exception
+) {
+    void *arguments[4] = {&red, &green, &blue, &alpha};
+    MonoObject *color = mono_runtime_invoke(
+        g_from_byte,
+        NULL,
+        arguments,
+        exception
+    );
+    if (!color || (exception && *exception) ||
+        xxf_mono_object_get_class(color) != g_color_class) {
+        return NULL;
+    }
+    return color;
+}
+
+static bool type_is(MonoType *type, int kind, MonoClass *klass) {
+    if (!type || type->byref || xxf_mono_type_get_type(type) != kind) {
+        return false;
+    }
+    return !klass || mono_class_from_mono_type(type) == klass;
+}
+
+static bool has_void_return(MonoMethodSignature *signature) {
+    return signature && type_is(
+        mono_signature_get_return_type(signature),
+        MONO_TYPE_VOID,
+        NULL
     );
 }
 
-static void finish_evidence_file(int result) {
-    uint8_t digest[32];
-    char hex[65];
-    Sha256Context final_hash = g_evidence_hash;
-    sha256_final(&final_hash, digest);
-    for (size_t i = 0; i < sizeof(digest); ++i) {
-        static const char digits[] = "0123456789abcdef";
-        hex[i * 2] = digits[digest[i] >> 4];
-        hex[i * 2 + 1] = digits[digest[i] & 0x0fU];
-    }
-    hex[64] = '\0';
+static bool method_is_static(MonoMethod *method) {
+    uint32_t implementation_flags = 0;
+    return (mono_method_get_flags(method, &implementation_flags) &
+            MONO_METHOD_ATTR_STATIC) != 0;
+}
 
-    g_hash_evidence = false;
-    char footer[320];
-    int length = snprintf(
-        footer,
-        sizeof(footer),
-        "CONTENT_BYTES=%zu\nCONTENT_SHA256=%s\nTRUNCATED=%u\nWRITE_FAILED=%u\n"
-        "RESULT=%d\nSTATUS=%s\n",
-        g_evidence_bytes,
-        hex,
-        g_evidence_truncated ? 1U : 0U,
-        g_evidence_write_failed ? 1U : 0U,
-        result,
-        (result == 0 && !g_evidence_truncated && !g_evidence_write_failed)
-            ? "complete"
-            : "incomplete"
+static bool validate_signatures(const RainbowRuntime *runtime) {
+    MonoMethodSignature *from = mono_method_signature(runtime->from_byte);
+    MonoMethodSignature *setter = mono_method_signature(
+        runtime->set_text_color
     );
-    if (length > 0) {
-        size_t footer_size = (size_t)length < sizeof(footer)
-            ? (size_t)length
-            : sizeof(footer) - 1U;
-        /* The footer is always attempted even when the bounded evidence body
-         * reached its cap; STATUS then remains explicitly incomplete. */
-        write_bytes(footer, footer_size, false);
+    MonoMethodSignature *prepare = mono_method_signature(
+        runtime->on_prepare_render
+    );
+    if (!from || !setter || !prepare) {
+        return false;
     }
-    if (g_log_fd >= 0) {
-        sceKernelFsync(g_log_fd);
+    if (!method_is_static(runtime->from_byte) ||
+        method_is_static(runtime->set_text_color) ||
+        method_is_static(runtime->on_prepare_render)) {
+        return false;
+    }
+    if (mono_signature_get_param_count(from) != 4U ||
+        mono_signature_get_param_count(setter) != 1U ||
+        mono_signature_get_param_count(prepare) != 0U) {
+        return false;
+    }
+    void *iterator = NULL;
+    for (unsigned int i = 0; i < 4U; ++i) {
+        MonoType *parameter = mono_signature_get_params(from, &iterator);
+        if (!type_is(parameter, MONO_TYPE_U1, NULL)) {
+            return false;
+        }
+    }
+    if (!type_is(
+            mono_signature_get_return_type(from),
+            MONO_TYPE_VALUETYPE,
+            runtime->color
+        )) {
+        return false;
+    }
+    iterator = NULL;
+    MonoType *color_parameter = mono_signature_get_params(setter, &iterator);
+    if (!type_is(color_parameter, MONO_TYPE_VALUETYPE, runtime->color) ||
+        !has_void_return(setter) || !has_void_return(prepare)) {
+        return false;
+    }
+    return mono_method_get_class(runtime->from_byte) == runtime->color &&
+        mono_method_get_class(runtime->set_text_color) == runtime->label &&
+        mono_method_get_class(runtime->on_prepare_render) == runtime->label;
+}
+
+static void rainbow_rgb(
+    uint64_t bucket,
+    uint8_t *red,
+    uint8_t *green,
+    uint8_t *blue
+) {
+    uint32_t hue = (uint32_t)(
+        (bucket * RAINBOW_HUE_ADVANCE) % RAINBOW_HUE_STEPS
+    );
+    uint32_t sector = hue >> 8;
+    uint8_t offset = (uint8_t)(hue & 0xffU);
+    uint8_t falling = (uint8_t)(255U - offset);
+    *red = *green = *blue = 0;
+    switch (sector) {
+        case 0: *red = 255; *green = offset; break;
+        case 1: *red = falling; *green = 255; break;
+        case 2: *green = 255; *blue = offset; break;
+        case 3: *green = falling; *blue = 255; break;
+        case 4: *red = offset; *blue = 255; break;
+        default: *red = 255; *blue = falling; break;
     }
 }
 
-static int dump_metadata_evidence(const RainbowRuntimeEvidence *evidence) {
-    if (!evidence || !evidence->domain || !evidence->pui_image) {
-        log_line("COLLECTOR status=invalid-runtime-evidence");
-        return -20;
+static void release_palette(void) {
+    for (uint32_t i = 0; i < RAINBOW_PALETTE_SIZE; ++i) {
+        if (g_palette[i]) {
+            mono_gchandle_free(g_palette[i]);
+            g_palette[i] = 0;
+        }
     }
+}
 
-    log_line("COLLECTOR mode=read-only-mono-metadata version=1");
-    log_line("COLLECTOR no_hooks=1 no_text_writes=1 no_ui_patches=1");
-    int pui_result = dump_image_metadata("PUI", evidence->pui_image);
-    MonoImage *app_image = open_shellui_app_image(evidence->domain);
-    int app_result = dump_image_metadata("SceShellUI-app", app_image);
-    if (pui_result != 0 || app_result != 0) {
-        log_line(
-            "COLLECTOR status=failed pui_result=%d app_result=%d",
-            pui_result,
-            app_result
+static bool build_palette(void) {
+    memset(g_palette, 0, sizeof(g_palette));
+    for (uint32_t i = 0; i < RAINBOW_PALETTE_SIZE; ++i) {
+        uint8_t red;
+        uint8_t green;
+        uint8_t blue;
+        rainbow_rgb(i, &red, &green, &blue);
+        MonoObject *exception = NULL;
+        MonoObject *color = create_color(
+            red,
+            green,
+            blue,
+            255U,
+            &exception
         );
-        return -21;
+        if (!color || exception) {
+            release_palette();
+            return false;
+        }
+        uint32_t handle = mono_gchandle_new(color, 1);
+        MonoObject *rooted = handle
+            ? mono_gchandle_get_target(handle)
+            : NULL;
+        if (!rooted || xxf_mono_object_get_class(rooted) != g_color_class) {
+            if (handle) {
+                mono_gchandle_free(handle);
+            }
+            release_palette();
+            return false;
+        }
+        g_palette[i] = handle;
     }
-    if (g_evidence_truncated || g_evidence_write_failed) {
-        return -22;
-    }
-    log_line("COLLECTOR status=complete");
-    return 0;
+    return true;
 }
 
-static int collect_runtime_evidence(RainbowRuntimeEvidence *out) {
-    memset(out, 0, sizeof(*out));
+static void fail_runtime(void) {
+    if (__atomic_exchange_n(&g_effect_failed, true, __ATOMIC_ACQ_REL)) {
+        return;
+    }
+    __atomic_store_n(&g_effect_enabled, false, __ATOMIC_RELEASE);
+    notify_user("XXFWilson23: rainbow runtime validation failed");
+}
 
-    out->domain = mono_get_root_domain();
-    if (!out->domain) {
-        log_line("Mono root domain is unavailable");
+static bool mark_label_for_bucket(uintptr_t label, uint64_t bucket) {
+    if (g_seen_bucket != bucket) {
+        memset(g_seen_labels, 0, sizeof(g_seen_labels));
+        g_seen_bucket = bucket;
+    }
+    uint64_t mixed = (uint64_t)label;
+    mixed ^= mixed >> 33;
+    mixed *= 0xff51afd7ed558ccdULL;
+    mixed ^= mixed >> 33;
+    uint32_t index = (uint32_t)mixed & (RAINBOW_SEEN_CAPACITY - 1U);
+    for (uint32_t probe = 0; probe < RAINBOW_SEEN_CAPACITY; ++probe) {
+        uintptr_t *slot = &g_seen_labels[
+            (index + probe) & (RAINBOW_SEEN_CAPACITY - 1U)
+        ];
+        if (*slot == label) {
+            return false;
+        }
+        if (*slot == 0) {
+            *slot = label;
+            return true;
+        }
+    }
+    /* A full table is not a validation failure; applying again is safe. */
+    return true;
+}
+
+static void on_prepare_render_hook(void *instance) {
+    OnPrepareRenderFn original = __atomic_load_n(
+        &g_original,
+        __ATOMIC_ACQUIRE
+    );
+    if (!original) {
+        return;
+    }
+    if (!instance || !__atomic_load_n(&g_effect_enabled, __ATOMIC_ACQUIRE) ||
+        __atomic_exchange_n(&g_hook_active, true, __ATOMIC_ACQ_REL)) {
+        original(instance);
+        return;
+    }
+
+    uint64_t bucket = sceKernelGetProcessTime() / RAINBOW_INTERVAL_US;
+    if (!mark_label_for_bucket((uintptr_t)instance, bucket)) {
+        original(instance);
+        __atomic_store_n(&g_hook_active, false, __ATOMIC_RELEASE);
+        return;
+    }
+
+    uint32_t label_handle = mono_gchandle_new((MonoObject *)instance, 1);
+    MonoObject *label = label_handle
+        ? mono_gchandle_get_target(label_handle)
+        : NULL;
+    bool applied = false;
+    if (label) {
+        uint32_t index = (uint32_t)(bucket % RAINBOW_PALETTE_SIZE);
+        MonoObject *color = mono_gchandle_get_target(g_palette[index]);
+        void *color_data = color ? mono_object_unbox(color) : NULL;
+        if (color_data) {
+            void *arguments[1] = {color_data};
+            MonoObject *exception = NULL;
+            mono_runtime_invoke(
+                g_set_text_color,
+                label,
+                arguments,
+                &exception
+            );
+            applied = exception == NULL;
+            label = mono_gchandle_get_target(label_handle);
+        }
+    }
+    if (!applied) {
+        fail_runtime();
+    }
+    if (label) {
+        original(label);
+    } else {
+        /* No managed call ran without a pinned target, so the incoming
+         * pointer is still valid for the mandatory original invocation. */
+        original(instance);
+    }
+    if (label_handle) {
+        mono_gchandle_free(label_handle);
+    }
+    __atomic_store_n(&g_hook_active, false, __ATOMIC_RELEASE);
+}
+
+static int resolve_and_install(RainbowRuntime *runtime) {
+    memset(runtime, 0, sizeof(*runtime));
+    runtime->domain = mono_get_root_domain();
+    if (!runtime->domain) {
         return -1;
     }
-
-    out->attached_thread = mono_thread_attach(out->domain);
-    if (!out->attached_thread) {
-        log_line("mono_thread_attach failed");
+    runtime->thread = mono_thread_attach(runtime->domain);
+    if (!runtime->thread) {
         return -2;
     }
-
-    out->pui_image = open_pui_image(out->domain);
-    if (!out->pui_image) {
-        log_line("PUI image was not found");
+    runtime->pui = open_pui(runtime->domain);
+    if (!runtime->pui) {
         return -3;
     }
-
-#if XXF_RAINBOW_COLLECTOR
-    /* Collector mode only needs the live domain plus PUI image. It must not
-     * depend on, resolve, invoke, or write through the later effect members. */
-    log_line("Collector attached to the live Mono domain and PUI image");
-    return 0;
-#else
-
-    out->label_class = mono_class_from_name(
-        out->pui_image,
+    runtime->label = mono_class_from_name(
+        runtime->pui,
         "Sce.PlayStation.PUI.UI2",
         "Label"
     );
-    MonoClass *application_class = mono_class_from_name(
-        out->pui_image,
+    runtime->color = mono_class_from_name(
+        runtime->pui,
         "Sce.PlayStation.PUI",
-        "Application"
+        "UIColor"
     );
-    if (!out->label_class || !application_class) {
-        log_line("Required PUI classes are absent");
+    if (!runtime->label || !runtime->color) {
         return -4;
     }
-
     MonoProperty *text_color = mono_class_get_property_from_name(
-        out->label_class,
+        runtime->label,
         "TextColor"
     );
-    out->text_color_setter = text_color
+    runtime->set_text_color = text_color
         ? mono_property_get_set_method(text_color)
         : NULL;
-    out->application_update = mono_class_get_method_from_name(
-        application_class,
-        "Update",
+    runtime->from_byte = mono_class_get_method_from_name(
+        runtime->color,
+        "FromByte",
+        4
+    );
+    runtime->on_prepare_render = mono_class_get_method_from_name(
+        runtime->label,
+        "OnPrepareRender",
         0
     );
-    if (!out->text_color_setter || !out->application_update) {
-        log_line("TextColor setter or Application.Update is absent");
+    if (!runtime->set_text_color || !runtime->from_byte ||
+        !runtime->on_prepare_render) {
         return -5;
     }
 
-    out->text_color_aot = (PuiTextColorAotFn)mono_aot_get_method(
-        out->domain,
-        out->text_color_setter
-    );
-    out->application_update_aot = mono_aot_get_method(
-        out->domain,
-        out->application_update
-    );
-    if (!out->text_color_aot || !out->application_update_aot) {
-        log_line("PUI AOT addresses were not resolved");
+    g_color_class = runtime->color;
+    g_set_text_color = runtime->set_text_color;
+    g_from_byte = runtime->from_byte;
+    if (!validate_signatures(runtime)) {
         return -6;
     }
-
-    log_line(
-        "Validated PUI members: TextColor=%p Application.Update=%p",
-        (void *)out->text_color_aot,
-        out->application_update_aot
+    if (!build_palette()) {
+        return -7;
+    }
+    void *target = mono_aot_get_method(
+        runtime->domain,
+        runtime->on_prepare_render
     );
-    return 0;
-#endif
-}
-
-static int activate_rainbow(const RainbowRuntimeEvidence *evidence) {
-#if XXF_RAINBOW_COLLECTOR
-    /* Collector mode deliberately returns from collect_runtime_evidence()
-     * before resolving any setter. Validate only the fields the read-only
-     * collector actually requires, otherwise every collector run stops here
-     * with -1 and never writes its metadata body. */
-    if (!evidence || !evidence->domain || !evidence->pui_image) {
-        return -1;
+    if (!target) {
+        release_palette();
+        return -8;
     }
-    return dump_metadata_evidence(evidence);
-#else
-    if (!evidence || !evidence->text_color_setter) {
-        return -1;
+    log_line("Resolved UI2.Label.OnPrepareRender at %p", target);
+    int hook_result = install_hook(
+        &g_hook,
+        (uintptr_t)target,
+        (uintptr_t)on_prepare_render_hook,
+        &g_original
+    );
+    if (hook_result != 0) {
+        release_palette();
     }
-
-#if XXF_RAINBOW_METADATA_READY
-    /*
-     * Implementation point: enumerate the exact live 14.02 ShellUI tree,
-     * schedule a 20 Hz HSV tick on ShellUI's own update thread, and call
-     * mono_runtime_invoke(text_color_setter, label, &args, &exception).
-     * This branch is enabled only after the captured metadata proves the
-     * root/child APIs. No setter or Update prologue is detoured here.
-     */
-    return -1;
-#else
-    log_line("Rainbow activation held: exact 14.02 label-tree metadata pending");
-    return RAINBOW_PENDING_METADATA;
-#endif
-#endif
+    return hook_result;
 }
 
 static void *initialise_thread(void *unused) {
     (void)unused;
     sceKernelUsleep(1000000);
-
-    RainbowRuntimeEvidence evidence;
-    int result = collect_runtime_evidence(&evidence);
+    RainbowRuntime runtime;
+    int result = resolve_and_install(&runtime);
     if (result == 0) {
-        result = activate_rainbow(&evidence);
-    }
-    if (evidence.attached_thread) {
-        mono_thread_detach(evidence.attached_thread);
-        evidence.attached_thread = NULL;
-    }
-    log_line("Initialisation result: %d", result);
-    finish_evidence_file(result);
-    if (g_log_fd >= 0) {
-        sceKernelClose(g_log_fd);
-        g_log_fd = -1;
-    }
-#if XXF_RAINBOW_COLLECTOR
-    if (result == 0) {
-        notify_user("XXFWilson23: ShellUI metadata saved to /user/data");
-    } else {
-        notify_user("XXFWilson23: metadata collector failed (%d)", result);
-    }
-#elif XXF_RAINBOW_METADATA_READY
-    if (result == 0) {
+        __atomic_store_n(&g_effect_enabled, true, __ATOMIC_RELEASE);
+        log_line("Rainbow enabled with one verified render-thread hook");
         notify_user("XXFWilson23: rainbow ShellUI text enabled");
     } else {
+        log_line("Rainbow initialisation failed: %d", result);
         notify_user("XXFWilson23: rainbow module failed (%d)", result);
     }
-#else
-    notify_user("XXFWilson23: rainbow metadata gate pending");
-#endif
+    if (runtime.thread) {
+        mono_thread_detach(runtime.thread);
+    }
+    if (g_log_fd >= 0) {
+        sceKernelFsync(g_log_fd);
+    }
     return NULL;
 }
 
 int module_start(size_t argc, const void *args) {
     (void)argc;
     (void)args;
-
-    sceKernelMkdir(EVIDENCE_DIR, 0777);
-    g_log_fd = sceKernelOpen(LOG_PATH, 0x0601, 0666);
-    if (g_log_fd < 0) {
-        notify_user("XXFWilson23: metadata evidence file could not be opened");
-        return g_log_fd;
-    }
-    g_evidence_bytes = 0;
-    g_evidence_truncated = false;
-    g_evidence_write_failed = false;
-    sha256_init(&g_evidence_hash);
-    g_hash_evidence = true;
-    log_line("XXFWilson23 ShellUI module loaded");
-    log_line("EVIDENCE_PATH=%s", LOG_PATH);
+    sceKernelMkdir(RAINBOW_DIR, 0777);
+    g_log_fd = sceKernelOpen(RAINBOW_LOG, 0x0601, 0666);
+    log_line("XXFWilson23 standalone rainbow module loaded");
+    log_line("LOG_PATH=%s", RAINBOW_LOG);
 
     OrbisPthread thread;
     int result = scePthreadCreate(
@@ -757,11 +781,11 @@ int module_start(size_t argc, const void *args) {
         "xxf_rainbow_init"
     );
     if (result != 0) {
-        log_line("Initialisation thread creation failed: 0x%08x", result);
-        finish_evidence_file(result);
-        sceKernelClose(g_log_fd);
-        g_log_fd = -1;
-        notify_user("XXFWilson23: collector thread failed (0x%08x)", result);
+        notify_user("XXFWilson23: rainbow thread failed (0x%08x)", result);
+        if (g_log_fd >= 0) {
+            sceKernelClose(g_log_fd);
+            g_log_fd = -1;
+        }
         return result;
     }
     scePthreadDetach(thread);
@@ -771,10 +795,9 @@ int module_start(size_t argc, const void *args) {
 int module_stop(size_t argc, const void *args) {
     (void)argc;
     (void)args;
-    log_line("XXFWilson23 ShellUI module stopped");
-    if (g_log_fd >= 0) {
-        sceKernelClose(g_log_fd);
-        g_log_fd = -1;
-    }
-    return 0;
+    /* A live render-thread detour cannot be removed without quiescing
+     * SceShellUI. Refuse unload and keep the module resident until reboot. */
+    log_line("Unload refused: reboot is required to remove the live hook");
+    notify_user("XXFWilson23: rainbow module remains active until reboot");
+    return -1;
 }

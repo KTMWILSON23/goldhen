@@ -1,55 +1,51 @@
-# XXFWilson23 PS4 ShellUI metadata collector
+# XXFWilson23 PS4 14.02 rainbow ShellUI text
 
-This branch builds an intermediate, read-only metadata collector for PS4
-firmware 14.02. It does **not** enable rainbow text. Its only purpose is to
-record the live managed PUI/ShellUI API names needed to implement that effect
-without guessing or detouring unverified native instructions.
+This branch builds a volatile ShellUI module for PS4 firmware 14.02. It changes
+native PS4 UI2 label text through the managed PUI `TextColor` property; it is
+not a web-page animation and it does not modify `goldhen.bin`.
 
-## Delivery design
+## Artifacts
 
-The build has two parts:
+1. `shellui/bin/xxfwilson23_rainbow_shellui.prx` is loaded into `SceShellUI`.
+2. `payload/rainbow_loader.bin` embeds that exact PRX, stages it as
+   `/user/data/xxfwilson23_rainbow_shellui.prx`, and asks GoldHEN SDK command 6
+   to load it into `SceShellUI`.
 
-1. `shellui/bin/xxfwilson23_shellui_metadata_collector.prx` attaches to the
-   Mono runtime already running inside `SceShellUI` and enumerates relevant
-   class, property, and method metadata.
-2. `payload/shellui_metadata_loader.bin` embeds that PRX, writes it to
-   `/user/data/xxfwilson23_shellui_metadata_collector.prx`, and asks GoldHEN
-   SDK syscall 500 to load it into `SceShellUI`. `/user/data` is shared across
-   the BinLoader and `SceShellUI` process sandboxes. Before loading, the file is
-   set to mode `0777`, matching GoldHEN's own plugin-loader requirement. The
-   loader removes that file only if writing, permission setup, or loading fails.
-3. The PRX writes bounded evidence to
-   `/user/data/xxfwilson23-rainbow/pui-metadata-1402.txt`, including a completion
-   status and SHA-256 digest.
+Both components are volatile and disappear after a full PS4 reboot. The module
+is never added to GoldHEN's persistent plugin list.
 
-The loaded module is volatile and disappears after a PS4 reboot.
-Nothing is added to GoldHEN's persistent plugin list, and `goldhen.bin` is not
-modified.
+## Runtime validation and safety
 
-The collector installs no hooks, performs no `TextColor` writes, and makes no
-UI changes.
+The implementation uses the live 14.02 metadata captured from this console. It
+requires these exact managed contracts before making any code change:
 
-## Current validation gate
+- `Sce.PlayStation.PUI.UI2.Label.OnPrepareRender()` is an instance method
+  declared by `Label` and returns `void`;
+- `Label.TextColor` has an instance setter accepting exactly one `UIColor`;
+- `UIColor.FromByte(byte, byte, byte, byte)` is static and returns `UIColor`.
 
-The delivery path, Mono attachment, and bounded read-only metadata enumeration
-are implemented. The actual label-tree walk remains disabled with
-`XXF_RAINBOW_METADATA_READY=0` until this capture identifies the exact
-root/child APIs. This collector must not be presented as a working rainbow
-build.
+The color palette is created through `mono_runtime_invoke` and held by pinned
+Mono GC handles. The module installs one five-byte relative detour on the
+verified AOT `Label.OnPrepareRender` entry. Before installing it, HDE64 decodes
+whole instructions and rejects relative control flow, RIP-relative operands,
+returns, existing detours, or a target outside signed 32-bit jump range. The
+original bytes and installed jump are read back through syscall 108. Any failed
+check stops without enabling the effect.
 
-This gate prevents two known failure modes:
+The hook runs on ShellUI's own render thread, invokes the managed setter with a
+pinned boxed `UIColor`, then calls the original method through a checked
+trampoline. The live detour is intentionally not removed at runtime; rebooting
+the PS4 is the supported way to unload it.
 
-- changing only labels created after the module loads; and
-- detouring an AOT prologue without proving its instruction boundaries.
-
-The final implementation will call the `TextColor` setter through
-`mono_runtime_invoke` on ShellUI's own thread. The managed `UIColor` value is
-passed by address; it is never passed as a native by-value struct.
+This validation greatly reduces risk, but live code detouring is inherently
+experimental and can still panic the console. The log is written to
+`/user/data/xxfwilson23-rainbow/rainbow-1402.log`.
 
 ## Build
 
-GitHub Actions builds both stages and verifies that the final `.bin` contains
-the exact PRX bytes produced earlier in the same job. For a local Linux build:
+GitHub Actions builds both stages and verifies that `rainbow_loader.bin`
+contains exactly one byte-for-byte copy of the PRX produced in the same job.
+For a local Linux build:
 
 ```sh
 export OO_PS4_TOOLCHAIN=/path/to/OpenOrbis/PS4Toolchain
@@ -61,17 +57,13 @@ make
 The payload stage also requires `PS4SDK` from
 `Scene-Collective/ps4-payload-sdk`.
 
-## Collector usage
+## Use
 
-1. Run the full 14.02 GoldHEN build.
-2. Send `shellui_metadata_loader.bin` to GoldHEN BinLoader on port 9090.
-3. Wait for the `XXFWilson23` collector completion notification.
-4. Retrieve `/user/data/xxfwilson23-rainbow/pui-metadata-1402.txt` through GoldHEN
-   FTP and verify its footer before using the evidence.
-5. Reboot the PS4 to unload the collector.
+1. Load GoldHEN and enable its BinLoader server.
+2. Send `rainbow_loader.bin` to port 9090 once.
+3. Wait for `XXFWilson23: rainbow ShellUI text enabled`.
+4. Fully reboot the PS4 to remove the module.
 
-Run the collector only once per boot. A second injection can load another copy
-of the PRX and make both copies compete for the same evidence file.
-
-See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for required source-level
-attribution. User-facing notifications are branded `XXFWilson23`.
+Do not inject the loader twice on the same boot. See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for source-level attribution.
+User-facing notifications are branded `XXFWilson23`.

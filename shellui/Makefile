@@ -6,9 +6,7 @@ ifndef GOLDHEN_SDK
 $(error GOLDHEN_SDK is not set)
 endif
 
-PLUGIN_NAME := xxfwilson23_shellui_metadata_collector
-RAINBOW_METADATA_READY ?= 0
-RAINBOW_COLLECTOR ?= 1
+PLUGIN_NAME := xxfwilson23_rainbow_shellui
 CC := clang
 LD := ld.lld
 FSELF := $(OO_PS4_TOOLCHAIN)/bin/linux/create-fself
@@ -23,8 +21,6 @@ CFLAGS := \
 	-std=c11 -Wall -Wextra -Werror \
 	-Wno-unused-parameter -fPIC -funwind-tables \
 	-D__ORBIS__ -D__PS4__ \
-	-DXXF_RAINBOW_METADATA_READY=$(RAINBOW_METADATA_READY) \
-	-DXXF_RAINBOW_COLLECTOR=$(RAINBOW_COLLECTOR) \
 	-isysroot $(OO_PS4_TOOLCHAIN) \
 	-isystem $(OO_PS4_TOOLCHAIN)/include \
 	-I$(GOLDHEN_SDK)/include

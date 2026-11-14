@@ -1,4 +1,4 @@
-name: Build PS4 ShellUI metadata collector
+name: Build PS4 14.02 rainbow ShellUI module
 
 on:
   workflow_dispatch:
@@ -70,14 +70,14 @@ jobs:
       - name: Verify embedded artifact
         run: make verify
 
-      - name: Upload collector artifacts
+      - name: Upload rainbow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: xxfwilson23-shellui-metadata-collector-${{ github.run_id }}-${{ github.sha }}
+          name: xxfwilson23-rainbow-shellui-${{ github.run_id }}-${{ github.sha }}
           path: |
-            shellui/bin/xxfwilson23_shellui_metadata_collector.prx
-            payload/shellui_metadata_loader.bin
-            payload/shellui_metadata_loader.map
+            shellui/bin/xxfwilson23_rainbow_shellui.prx
+            payload/rainbow_loader.bin
+            payload/rainbow_loader.map
             build-manifest.json
             artifact-sha256.txt
             README.md

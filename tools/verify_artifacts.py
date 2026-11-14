@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the collector payload and write reproducible artifact hashes."""
+"""Verify the rainbow payload and write reproducible artifact hashes."""
 
 from __future__ import annotations
 
@@ -26,6 +26,8 @@ def main() -> int:
     payload_digest = hashlib.sha256(payload).hexdigest()
     map_digest = hashlib.sha256(linker_map).hexdigest()
 
+    if manifest.get("component") != args.prx.name:
+        raise SystemExit("manifest component does not match the built PRX")
     if manifest.get("size") != len(prx) or manifest.get("sha256") != prx_digest:
         raise SystemExit("manifest does not describe the built PRX")
     if not linker_map:

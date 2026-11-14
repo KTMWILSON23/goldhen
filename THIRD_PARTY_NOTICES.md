@@ -37,12 +37,20 @@ Builds also fetch pinned revisions of, but do not commit copies of:
 - `OpenOrbis/OpenOrbis-PS4-Toolchain`
 - `Scene-Collective/ps4-payload-sdk`
 
+The repository includes the HDE64 instruction decoder files used for
+fail-closed prologue validation. Their original source headers are preserved:
+
+- Hacker Disassembler Engine 64, copyright (c) 2008-2009 Vyacheslav Patkov.
+
+Those files were taken from the same HDE64 copy used by the GoldHEN plugin
+source tree; no authorship claim is made over them.
+
 Those projects remain subject to their own licenses and attribution terms.
 No repository-wide license file was found at the pinned
 `Scene-Collective/ps4-payload-sdk` revision. At least
 `libPS4/source/pfs.c` and `libPS4/source/pkg.c` carry GPL v2 notices; this file
 does not infer a single license for every file in that dependency. The build
 therefore publishes the loader linker map so the exact linked object set can
-be reviewed before redistribution. This collector artifact is not represented
-as a final public release. The ShellUI PRX is built separately with OpenOrbis
-and is not linked with `libPS4`.
+be reviewed before redistribution. This experimental artifact is not
+represented as a final public release. The ShellUI PRX is built separately
+with OpenOrbis and is not linked with `libPS4`.
