@@ -55,7 +55,7 @@ typedef struct MonoTableInfo MonoTableInfo;
 #define XXF_RAINBOW_COLLECTOR 1
 #endif
 
-#define EVIDENCE_DIR "/data/xxfwilson23-rainbow"
+#define EVIDENCE_DIR "/user/data/xxfwilson23-rainbow"
 #define LOG_PATH EVIDENCE_DIR "/pui-metadata-1402.txt"
 #define EVIDENCE_MAX_BYTES (512U * 1024U)
 #define MONO_TABLE_TYPEDEF 0x02
@@ -714,7 +714,7 @@ static void *initialise_thread(void *unused) {
     }
 #if XXF_RAINBOW_COLLECTOR
     if (result == 0) {
-        notify_user("XXFWilson23: ShellUI metadata saved to /data");
+        notify_user("XXFWilson23: ShellUI metadata saved to /user/data");
     } else {
         notify_user("XXFWilson23: metadata collector failed (%d)", result);
     }

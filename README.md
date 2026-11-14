@@ -19,7 +19,7 @@ The build has two parts:
    set to mode `0777`, matching GoldHEN's own plugin-loader requirement. The
    loader removes that file only if writing, permission setup, or loading fails.
 3. The PRX writes bounded evidence to
-   `/data/xxfwilson23-rainbow/pui-metadata-1402.txt`, including a completion
+   `/user/data/xxfwilson23-rainbow/pui-metadata-1402.txt`, including a completion
    status and SHA-256 digest.
 
 The loaded module is volatile and disappears after a PS4 reboot.
@@ -66,7 +66,7 @@ The payload stage also requires `PS4SDK` from
 1. Run the full 14.02 GoldHEN build.
 2. Send `shellui_metadata_loader.bin` to GoldHEN BinLoader on port 9090.
 3. Wait for the `XXFWilson23` collector completion notification.
-4. Retrieve `/data/xxfwilson23-rainbow/pui-metadata-1402.txt` through GoldHEN
+4. Retrieve `/user/data/xxfwilson23-rainbow/pui-metadata-1402.txt` through GoldHEN
    FTP and verify its footer before using the evidence.
 5. Reboot the PS4 to unload the collector.
 
