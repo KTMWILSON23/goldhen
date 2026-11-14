@@ -12,10 +12,11 @@ The build has two parts:
 1. `shellui/bin/xxfwilson23_shellui_metadata_collector.prx` attaches to the
    Mono runtime already running inside `SceShellUI` and enumerates relevant
    class, property, and method metadata.
-2. `payload/shellui_metadata_loader.bin` embeds that PRX, writes it to the
-   stable path `/data/xxfwilson23_rainbow_shellui.prx`, and asks GoldHEN SDK
-   syscall 500 to load it into `SceShellUI`. The loader removes that file only
-   if writing or loading fails.
+2. `payload/shellui_metadata_loader.bin` embeds that PRX, writes it to
+   `/user/data/xxfwilson23_shellui_metadata_collector.prx`, and asks GoldHEN
+   SDK syscall 500 to load it into `SceShellUI`. `/user/data` is shared across
+   the BinLoader and `SceShellUI` process sandboxes. The loader removes that
+   file only if writing or loading fails.
 3. The PRX writes bounded evidence to
    `/data/xxfwilson23-rainbow/pui-metadata-1402.txt`, including a completion
    status and SHA-256 digest.

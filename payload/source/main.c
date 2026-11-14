@@ -2,8 +2,9 @@
  * XXFWilson23 one-shot BinLoader payload.
  *
  * The generated embedded_shellui_prx.c is produced from the PRX built in the
- * same workflow. The payload writes it to a stable /data path and asks
- * GoldHEN to load it into SceShellUI. The file stays present after a reported
+ * same workflow. The payload writes it to /user/data, which is shared across
+ * the BinLoader and SceShellUI process sandboxes, and asks GoldHEN to load it
+ * into SceShellUI. The file stays present after a reported
  * successful load because the command's lifetime/ownership contract does not
  * prove that the module bytes are consumed eagerly. Failed writes/loads are
  * cleaned up.
@@ -13,7 +14,7 @@
 
 #define GOLDHEN_SDK_CMD_VERSION 0
 #define GOLDHEN_SDK_CMD_PROCESS_PRX_LOAD 6
-#define SHELLUI_PRX_PATH "/data/xxfwilson23_rainbow_shellui.prx"
+#define SHELLUI_PRX_PATH "/user/data/xxfwilson23_shellui_metadata_collector.prx"
 #define PRX_LOAD_RESULT_SENTINEL ((uint64_t)-1)
 
 extern const unsigned char embedded_shellui_prx[];
